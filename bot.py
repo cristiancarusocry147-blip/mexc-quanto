@@ -1,3 +1,4 @@
+
 import asyncio
 import aiohttp
 import ccxt.async_support as ccxt
@@ -6,11 +7,12 @@ import time
 import logging
 import traceback
 from datetime import datetime
-from flask import Flask, render_template_string, request, redirect
+from flask import Flask, request, jsonify, render_template_string
+import threading
+import os
 
 CONFIG_FILE = "config.json"
-POLL_INTERVAL = 3
-MAX_PAIRS = 50
+POLL_INTERVAL = 5
 CONCURRENCY = 10
 LOG_FILE = "bot.log"
 
@@ -30,14 +32,14 @@ def load_config():
         with open(CONFIG_FILE, "r") as f:
             data = json.load(f)
             data.setdefault("SPREAD_THRESHOLD", 1.0)
-            data.setdefault("PAIRS", [])
+            data.setdefault("PAIRS", ["BTC/USDT", "ETH/USDT"])
             return data
     except FileNotFoundError:
         example = {
-            "TELEGRAM_TOKEN": "INSERISCI_IL_TUO_TOKEN",
-            "CHAT_ID": "INSERISCI_CHAT_ID",
+            "TELEGRAM_TOKEN": "",
+            "CHAT_ID": "",
             "SPREAD_THRESHOLD": 1.0,
-            "PAIRS": []
+            "PAIRS": ["BTC/USDT", "ETH/USDT"]
         }
         with open(CONFIG_FILE, "w") as f:
             json.dump(example, f, indent=4)
@@ -49,6 +51,8 @@ TELEGRAM_TOKEN = CONFIG.get("TELEGRAM_TOKEN")
 CHAT_ID = CONFIG.get("CHAT_ID")
 SPREAD_THRESHOLD = float(CONFIG.get("SPREAD_THRESHOLD", 1.0))
 PAIRS = CONFIG.get("PAIRS", [])
+
+prices = {}  # spread live per dashboard
 
 # ---------------- TELEGRAM ----------------
 async def send_telegram_message(text, session=None):
@@ -102,41 +106,21 @@ async def try_quanto_mappings(session, base_symbol):
             return c, p
     return None, None
 
-async def build_pairs(exchange, limit=MAX_PAIRS):
-    markets = await exchange.load_markets()
-    swap_pairs = [
-        s for s, m in markets.items()
-        if m.get("type") == "swap" and ("USDT" in s or "USD" in s)
-    ]
-    return swap_pairs[:limit]
-
 # ---------------- MAIN LOOP ----------------
 async def poll_loop():
     ccxt_mexc = ccxt.mexc({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     session = aiohttp.ClientSession()
     semaphore = asyncio.Semaphore(CONCURRENCY)
-    prices = {}
     last_spread = {}
-    start_time = time.time()
 
-    if PAIRS:
-        pairs = PAIRS
-        logging.info(f"Monitoraggio di {len(pairs)} coppie dal config.json")
-    else:
-        pairs = await build_pairs(ccxt_mexc)
-        logging.info(f"Nessuna coppia specificata, caricate {len(pairs)} coppie da MEXC")
-
-    await send_telegram_message(f"🤖 Bot avviato.\nMonitoraggio di {len(pairs)} coppie su MEXC.", session)
-
-    asyncio.create_task(handle_status_commands(session, prices, start_time))
+    logging.info(f"Monitoraggio di {len(PAIRS)} coppie su MEXC.")
+    await send_telegram_message(f"🤖 Bot avviato.\nMonitoraggio di {len(PAIRS)} coppie su MEXC.", session)
 
     try:
         while True:
-            tasks = []
-            for symbol in pairs:
+            for symbol in CONFIG["PAIRS"]:
                 async with semaphore:
-                    tasks.append(process_pair(symbol, ccxt_mexc, session, prices, last_spread))
-            await asyncio.gather(*tasks)
+                    asyncio.create_task(process_pair(symbol, ccxt_mexc, session, last_spread))
             await asyncio.sleep(POLL_INTERVAL)
     except Exception as e:
         logging.error(f"Errore nel loop: {e}\n{traceback.format_exc()}")
@@ -145,7 +129,7 @@ async def poll_loop():
         await session.close()
         await ccxt_mexc.close()
 
-async def process_pair(symbol, exchange, session, prices, last_spread):
+async def process_pair(symbol, exchange, session, last_spread):
     try:
         mexc_p = await fetch_mexc_price(exchange, symbol)
         if not mexc_p:
@@ -155,7 +139,7 @@ async def process_pair(symbol, exchange, session, prices, last_spread):
         if not quanto_p:
             return
         spread = (quanto_p - mexc_p) / mexc_p * 100
-        prices[symbol] = spread
+        prices[symbol] = round(spread, 2)
 
         prev = last_spread.get(symbol, 0)
         if abs(spread) >= SPREAD_THRESHOLD and abs(spread) > abs(prev):
@@ -167,41 +151,14 @@ async def process_pair(symbol, exchange, session, prices, last_spread):
     except Exception as e:
         logging.debug(f"Errore {symbol}: {e}")
 
-# ---------------- STATUS HANDLER ----------------
-async def handle_status_commands(session, prices, start_time):
-    offset = 0
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-    while True:
-        try:
-            async with session.get(url, params={"offset": offset, "timeout": 10}) as resp:
-                data = await resp.json()
-                for update in data.get("result", []):
-                    offset = update["update_id"] + 1
-                    msg = update.get("message", {}).get("text", "")
-                    chat_id = update.get("message", {}).get("chat", {}).get("id")
-                    if msg == "/status" and str(chat_id) == str(CHAT_ID):
-                        uptime = int(time.time() - start_time)
-                        avg_spread = sum(prices.values()) / len(prices) if prices else 0
-                        text = (
-                            f"📊 *Status Bot*\n"
-                            f"Coppie monitorate: {len(prices)}\n"
-                            f"Spread medio: {avg_spread:.2f}%\n"
-                            f"Uptime: {uptime//3600}h {uptime%3600//60}m\n"
-                            f"Ultimo update: {datetime.utcnow().strftime('%H:%M:%S UTC')}"
-                        )
-                        await send_telegram_message(text, session)
-        except Exception:
-            pass
-        await asyncio.sleep(5)
-
-# ---------------- WEB DASHBOARD ----------------
+# ---------------- FLASK WEB DASHBOARD ----------------
 app = Flask(__name__)
 
-@app.route("/")
+@app.route('/')
 def home():
-    return redirect("/dashboard")
+    return "✅ MEXC Quanto Bot è attivo!"
 
-@app.route("/dashboard")
+@app.route('/dashboard')
 def dashboard():
     try:
         with open(CONFIG_FILE, "r") as f:
@@ -210,55 +167,77 @@ def dashboard():
     except Exception:
         current_pairs = PAIRS
 
+    msg = request.args.get("msg", "")
     html = """
     <h2>MEXC Quanto Bot Dashboard</h2>
+    {% if msg %}
+        <p style="color: green;">{{ msg }}</p>
+    {% endif %}
     <p>Coppie monitorate:</p>
-    <ul>
-    {% for pair in pairs %}
-        <li>{{ pair }}
-        <form action="/removepair" method="post" style="display:inline;">
-            <input type="hidden" name="pair" value="{{ pair }}">
-            <button type="submit">❌ Rimuovi</button>
-        </form>
-        </li>
-    {% endfor %}
-    </ul>
+    <table border="1" cellpadding="6" cellspacing="0">
+        <tr><th>Coppia</th><th>Spread (%)</th><th>Azioni</th></tr>
+        {% for pair in pairs %}
+        <tr>
+            <td>{{ pair }}</td>
+            <td>{{ prices.get(pair, '---') }}</td>
+            <td>
+                <form action="/removepair" method="post" style="display:inline;">
+                    <input type="hidden" name="pair" value="{{ pair }}">
+                    <button type="submit">❌</button>
+                </form>
+            </td>
+        </tr>
+        {% endfor %}
+    </table>
+    <br>
     <form action="/addpair" method="post">
         <input name="pair" placeholder="es. BTC/USDT" required>
         <button type="submit">➕ Aggiungi coppia</button>
     </form>
+    <script>
+        setTimeout(() => { window.location.reload(); }, 10000);
+    </script>
     """
-    return render_template_string(html, pairs=current_pairs)
+    return render_template_string(html, pairs=current_pairs, prices=prices, msg=msg)
 
-@app.route("/addpair", methods=["POST"])
+@app.route('/addpair', methods=['POST'])
 def add_pair():
-    pair = request.form.get("pair")
-    if pair:
-        with open(CONFIG_FILE, "r") as f:
-            cfg = json.load(f)
-        if "PAIRS" not in cfg:
-            cfg["PAIRS"] = []
-        if pair not in cfg["PAIRS"]:
-            cfg["PAIRS"].append(pair)
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(cfg, f, indent=4)
-    return redirect("/dashboard")
-
-@app.route("/removepair", methods=["POST"])
-def remove_pair():
-    pair = request.form.get("pair")
-    with open(CONFIG_FILE, "r") as f:
-        cfg = json.load(f)
-    if "PAIRS" in cfg and pair in cfg["PAIRS"]:
-        cfg["PAIRS"].remove(pair)
+    pair = request.form.get("pair", "").strip().upper()
+    if not pair:
+        return "Nessuna coppia specificata.", 400
+    CONFIG["PAIRS"].append(pair)
     with open(CONFIG_FILE, "w") as f:
-        json.dump(cfg, f, indent=4)
-    return redirect("/dashboard")
+        json.dump(CONFIG, f, indent=4)
+    return f"""<script>window.location.href='/dashboard?msg=✅ Coppia {pair} aggiunta con successo';</script>"""
 
-# ---------------- ENTRYPOINT ----------------
+@app.route('/removepair', methods=['POST'])
+def remove_pair():
+    pair = request.form.get("pair", "").strip().upper()
+    if pair in CONFIG["PAIRS"]:
+        CONFIG["PAIRS"].remove(pair)
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(CONFIG, f, indent=4)
+        return f"""<script>window.location.href='/dashboard?msg=❌ Coppia {pair} rimossa';</script>"""
+    return f"""<script>window.location.href='/dashboard?msg=⚠️ Coppia non trovata';</script>"""
+
+@app.route('/status')
+def status():
+    return jsonify({
+        "running": True,
+        "pairs": CONFIG["PAIRS"],
+        "prices": prices,
+        "spread_threshold": SPREAD_THRESHOLD
+    })
+
+# ---------------- AVVIO ----------------
+def start_async_loop():
+    asyncio.run(poll_loop())
+
 if __name__ == "__main__":
-    import threading
-    threading.Thread(target=lambda: asyncio.run(poll_loop()), daemon=True).start()
-    app.run(host="0.0.0.0", port=5000)
+    t = threading.Thread(target=start_async_loop, daemon=True)
+    t.start()
+
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
 
 
