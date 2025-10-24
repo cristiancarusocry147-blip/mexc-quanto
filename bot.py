@@ -6,11 +6,11 @@ import time
 import logging
 import traceback
 from datetime import datetime
-import threading
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, render_template_string, request, redirect
 
 CONFIG_FILE = "config.json"
 POLL_INTERVAL = 3
+MAX_PAIRS = 50
 CONCURRENCY = 10
 LOG_FILE = "bot.log"
 
@@ -30,18 +30,18 @@ def load_config():
         with open(CONFIG_FILE, "r") as f:
             data = json.load(f)
             data.setdefault("SPREAD_THRESHOLD", 1.0)
-            data.setdefault("PAIRS", ["BTC/USDT", "ETH/USDT"])
+            data.setdefault("PAIRS", [])
             return data
     except FileNotFoundError:
         example = {
             "TELEGRAM_TOKEN": "INSERISCI_IL_TUO_TOKEN",
             "CHAT_ID": "INSERISCI_CHAT_ID",
             "SPREAD_THRESHOLD": 1.0,
-            "PAIRS": ["BTC/USDT", "ETH/USDT"]
+            "PAIRS": []
         }
         with open(CONFIG_FILE, "w") as f:
             json.dump(example, f, indent=4)
-        print("Creato config.json — inserisci i tuoi dati Telegram.")
+        print("Creato config.json — inserisci il tuo TOKEN Telegram e CHAT_ID.")
         raise SystemExit(1)
 
 CONFIG = load_config()
@@ -102,6 +102,14 @@ async def try_quanto_mappings(session, base_symbol):
             return c, p
     return None, None
 
+async def build_pairs(exchange, limit=MAX_PAIRS):
+    markets = await exchange.load_markets()
+    swap_pairs = [
+        s for s, m in markets.items()
+        if m.get("type") == "swap" and ("USDT" in s or "USD" in s)
+    ]
+    return swap_pairs[:limit]
+
 # ---------------- MAIN LOOP ----------------
 async def poll_loop():
     ccxt_mexc = ccxt.mexc({"enableRateLimit": True, "options": {"defaultType": "swap"}})
@@ -109,14 +117,23 @@ async def poll_loop():
     semaphore = asyncio.Semaphore(CONCURRENCY)
     prices = {}
     last_spread = {}
+    start_time = time.time()
 
-    logging.info(f"Avvio bot con coppie: {PAIRS}")
-    await send_telegram_message(f"🤖 Bot avviato.\nMonitoraggio di {len(PAIRS)} coppie su MEXC.", session)
+    if PAIRS:
+        pairs = PAIRS
+        logging.info(f"Monitoraggio di {len(pairs)} coppie dal config.json")
+    else:
+        pairs = await build_pairs(ccxt_mexc)
+        logging.info(f"Nessuna coppia specificata, caricate {len(pairs)} coppie da MEXC")
+
+    await send_telegram_message(f"🤖 Bot avviato.\nMonitoraggio di {len(pairs)} coppie su MEXC.", session)
+
+    asyncio.create_task(handle_status_commands(session, prices, start_time))
 
     try:
         while True:
             tasks = []
-            for symbol in PAIRS:
+            for symbol in pairs:
                 async with semaphore:
                     tasks.append(process_pair(symbol, ccxt_mexc, session, prices, last_spread))
             await asyncio.gather(*tasks)
@@ -150,15 +167,49 @@ async def process_pair(symbol, exchange, session, prices, last_spread):
     except Exception as e:
         logging.debug(f"Errore {symbol}: {e}")
 
-# ---------------- FLASK DASHBOARD ----------------
+# ---------------- STATUS HANDLER ----------------
+async def handle_status_commands(session, prices, start_time):
+    offset = 0
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    while True:
+        try:
+            async with session.get(url, params={"offset": offset, "timeout": 10}) as resp:
+                data = await resp.json()
+                for update in data.get("result", []):
+                    offset = update["update_id"] + 1
+                    msg = update.get("message", {}).get("text", "")
+                    chat_id = update.get("message", {}).get("chat", {}).get("id")
+                    if msg == "/status" and str(chat_id) == str(CHAT_ID):
+                        uptime = int(time.time() - start_time)
+                        avg_spread = sum(prices.values()) / len(prices) if prices else 0
+                        text = (
+                            f"📊 *Status Bot*\n"
+                            f"Coppie monitorate: {len(prices)}\n"
+                            f"Spread medio: {avg_spread:.2f}%\n"
+                            f"Uptime: {uptime//3600}h {uptime%3600//60}m\n"
+                            f"Ultimo update: {datetime.utcnow().strftime('%H:%M:%S UTC')}"
+                        )
+                        await send_telegram_message(text, session)
+        except Exception:
+            pass
+        await asyncio.sleep(5)
+
+# ---------------- WEB DASHBOARD ----------------
 app = Flask(__name__)
 
-@app.route('/')
+@app.route("/")
 def home():
-    return "✅ Mexc Quanto Bot is running! Vai su /dashboard per controllare."
+    return redirect("/dashboard")
 
-@app.route('/dashboard')
+@app.route("/dashboard")
 def dashboard():
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            cfg = json.load(f)
+            current_pairs = cfg.get("PAIRS", [])
+    except Exception:
+        current_pairs = PAIRS
+
     html = """
     <h2>MEXC Quanto Bot Dashboard</h2>
     <p>Coppie monitorate:</p>
@@ -177,39 +228,37 @@ def dashboard():
         <button type="submit">➕ Aggiungi coppia</button>
     </form>
     """
-    return render_template_string(html, pairs=PAIRS)
+    return render_template_string(html, pairs=current_pairs)
 
-@app.route('/addpair', methods=['POST'])
-def addpair():
-    pair = request.form.get('pair')
-    if not pair:
-        return "Manca la coppia", 400
-    if pair not in PAIRS:
-        PAIRS.append(pair)
-        CONFIG["PAIRS"] = PAIRS
+@app.route("/addpair", methods=["POST"])
+def add_pair():
+    pair = request.form.get("pair")
+    if pair:
+        with open(CONFIG_FILE, "r") as f:
+            cfg = json.load(f)
+        if "PAIRS" not in cfg:
+            cfg["PAIRS"] = []
+        if pair not in cfg["PAIRS"]:
+            cfg["PAIRS"].append(pair)
         with open(CONFIG_FILE, "w") as f:
-            json.dump(CONFIG, f, indent=4)
-        return f"Aggiunta {pair} con successo! <a href='/dashboard'>Torna</a>"
-    else:
-        return f"{pair} è già presente! <a href='/dashboard'>Torna</a>"
+            json.dump(cfg, f, indent=4)
+    return redirect("/dashboard")
 
-@app.route('/removepair', methods=['POST'])
-def removepair():
-    pair = request.form.get('pair')
-    if pair in PAIRS:
-        PAIRS.remove(pair)
-        CONFIG["PAIRS"] = PAIRS
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(CONFIG, f, indent=4)
-        return f"Rimossa {pair} con successo! <a href='/dashboard'>Torna</a>"
-    return "Coppia non trovata! <a href='/dashboard'>Torna</a>"
-
-def start_flask():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+@app.route("/removepair", methods=["POST"])
+def remove_pair():
+    pair = request.form.get("pair")
+    with open(CONFIG_FILE, "r") as f:
+        cfg = json.load(f)
+    if "PAIRS" in cfg and pair in cfg["PAIRS"]:
+        cfg["PAIRS"].remove(pair)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=4)
+    return redirect("/dashboard")
 
 # ---------------- ENTRYPOINT ----------------
 if __name__ == "__main__":
+    import threading
     threading.Thread(target=lambda: asyncio.run(poll_loop()), daemon=True).start()
-    start_flask()
+    app.run(host="0.0.0.0", port=5000)
+
 
