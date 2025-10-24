@@ -1,4 +1,3 @@
-import os
 import asyncio
 import aiohttp
 import ccxt.async_support as ccxt
@@ -6,54 +5,52 @@ import json
 import time
 import logging
 import traceback
-import threading
 from datetime import datetime
-from flask import Flask, jsonify, request, render_template_string
+import threading
+from flask import Flask, request, jsonify, render_template_string
 
-# =============== CONFIGURAZIONE BASE ===============
 CONFIG_FILE = "config.json"
-POLL_INTERVAL = 5
-MAX_PAIRS = 50
+POLL_INTERVAL = 3
 CONCURRENCY = 10
 LOG_FILE = "bot.log"
 
+# ---------------- LOGGING ----------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"), logging.StreamHandler()],
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler()
+    ]
 )
 
+# ---------------- CONFIG ----------------
 def load_config():
     try:
         with open(CONFIG_FILE, "r") as f:
             data = json.load(f)
             data.setdefault("SPREAD_THRESHOLD", 1.0)
+            data.setdefault("PAIRS", ["BTC/USDT", "ETH/USDT"])
             return data
     except FileNotFoundError:
         example = {
             "TELEGRAM_TOKEN": "INSERISCI_IL_TUO_TOKEN",
             "CHAT_ID": "INSERISCI_CHAT_ID",
-            "SPREAD_THRESHOLD": 1.0
+            "SPREAD_THRESHOLD": 1.0,
+            "PAIRS": ["BTC/USDT", "ETH/USDT"]
         }
         with open(CONFIG_FILE, "w") as f:
             json.dump(example, f, indent=4)
-        print("Creato config.json — inserisci il tuo TOKEN Telegram e CHAT_ID.")
+        print("Creato config.json — inserisci i tuoi dati Telegram.")
         raise SystemExit(1)
 
 CONFIG = load_config()
 TELEGRAM_TOKEN = CONFIG.get("TELEGRAM_TOKEN")
 CHAT_ID = CONFIG.get("CHAT_ID")
 SPREAD_THRESHOLD = float(CONFIG.get("SPREAD_THRESHOLD", 1.0))
+PAIRS = CONFIG.get("PAIRS", [])
 
-# Stato globale del bot
-bot_status = {
-    "running": False,
-    "pairs": [],
-    "spreads": {},
-    "start_time": time.time(),
-}
-
-# =============== TELEGRAM ===============
+# ---------------- TELEGRAM ----------------
 async def send_telegram_message(text, session=None):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         return
@@ -66,7 +63,7 @@ async def send_telegram_message(text, session=None):
     except Exception as e:
         logging.error(f"Errore Telegram: {e}")
 
-# =============== FUNZIONI DI MERCATO ===============
+# ---------------- FETCH HELPERS ----------------
 async def fetch_mexc_price(exchange, symbol):
     try:
         ticker = await exchange.fetch_ticker(symbol)
@@ -105,39 +102,7 @@ async def try_quanto_mappings(session, base_symbol):
             return c, p
     return None, None
 
-async def build_pairs(exchange, limit=MAX_PAIRS):
-    markets = await exchange.load_markets()
-    swap_pairs = [
-        s for s, m in markets.items()
-        if m.get("type") == "swap" and ("USDT" in s or "USD" in s)
-    ]
-    return swap_pairs[:limit]
-
-# =============== LOGICA PRINCIPALE ===============
-async def process_pair(symbol, exchange, session, prices, last_spread):
-    try:
-        mexc_p = await fetch_mexc_price(exchange, symbol)
-        if not mexc_p:
-            return
-        base = symbol.split("/")[0]
-        quanto_sym, quanto_p = await try_quanto_mappings(session, base)
-        if not quanto_p:
-            return
-        spread = (quanto_p - mexc_p) / mexc_p * 100
-        prices[symbol] = spread
-        bot_status["spreads"][symbol] = spread
-
-        prev = last_spread.get(symbol, 0)
-        if abs(spread) >= SPREAD_THRESHOLD and abs(spread) > abs(prev):
-            direction = "Compra su MEXC / Vendi su Quanto" if spread > 0 else "Vendi su MEXC / Compra su Quanto"
-            msg = f"{'🟢' if spread>0 else '🔴'} {symbol}\nSpread: {spread:.2f}%\n{direction}"
-            logging.info(msg)
-            await send_telegram_message(msg, session)
-        last_spread[symbol] = spread
-
-    except Exception as e:
-        logging.debug(f"Errore {symbol}: {e}")
-
+# ---------------- MAIN LOOP ----------------
 async def poll_loop():
     ccxt_mexc = ccxt.mexc({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     session = aiohttp.ClientSession()
@@ -145,16 +110,13 @@ async def poll_loop():
     prices = {}
     last_spread = {}
 
-    pairs = await build_pairs(ccxt_mexc)
-    bot_status["pairs"] = pairs
-    bot_status["running"] = True
-    logging.info(f"Trovate {len(pairs)} coppie futures su MEXC.")
-    await send_telegram_message(f"🤖 Bot avviato. Monitoraggio di {len(pairs)} coppie su MEXC.", session)
+    logging.info(f"Avvio bot con coppie: {PAIRS}")
+    await send_telegram_message(f"🤖 Bot avviato.\nMonitoraggio di {len(PAIRS)} coppie su MEXC.", session)
 
     try:
         while True:
             tasks = []
-            for symbol in pairs:
+            for symbol in PAIRS:
                 async with semaphore:
                     tasks.append(process_pair(symbol, ccxt_mexc, session, prices, last_spread))
             await asyncio.gather(*tasks)
@@ -166,127 +128,88 @@ async def poll_loop():
         await session.close()
         await ccxt_mexc.close()
 
-# =============== THREAD PER IL BOT ===============
-def start_async_loop():
-    asyncio.run(poll_loop())
+async def process_pair(symbol, exchange, session, prices, last_spread):
+    try:
+        mexc_p = await fetch_mexc_price(exchange, symbol)
+        if not mexc_p:
+            return
+        base = symbol.split("/")[0]
+        quanto_sym, quanto_p = await try_quanto_mappings(session, base)
+        if not quanto_p:
+            return
+        spread = (quanto_p - mexc_p) / mexc_p * 100
+        prices[symbol] = spread
 
-threading.Thread(target=start_async_loop, daemon=True).start()
+        prev = last_spread.get(symbol, 0)
+        if abs(spread) >= SPREAD_THRESHOLD and abs(spread) > abs(prev):
+            direction = "Compra su MEXC / Vendi su Quanto" if spread > 0 else "Vendi su MEXC / Compra su Quanto"
+            msg = f"{'🟢' if spread>0 else '🔴'} {symbol}\nSpread: {spread:.2f}%\n{direction}"
+            logging.info(msg)
+            await send_telegram_message(msg, session)
+        last_spread[symbol] = spread
+    except Exception as e:
+        logging.debug(f"Errore {symbol}: {e}")
 
-# =============== FLASK SERVER ===============
+# ---------------- FLASK DASHBOARD ----------------
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "✅ Mexc Quanto Bot is running!"
-
-@app.route('/status')
-def status():
-    uptime = int(time.time() - bot_status["start_time"])
-    return jsonify({
-        "running": bot_status["running"],
-        "pairs": len(bot_status["pairs"]),
-        "uptime": f"{uptime//3600}h {uptime%3600//60}m",
-        "spreads": bot_status["spreads"]
-    })
-
-@app.route('/spreads')
-def get_spreads():
-    spreads = bot_status.get("spreads", {})
-    sorted_spreads = sorted(spreads.items(), key=lambda x: x[1], reverse=True)
-    result = [{"pair": pair, "spread": round(spread, 3)} for pair, spread in sorted_spreads]
-    return jsonify(result)
-
-@app.route('/addpair', methods=['POST'])
-def add_pair():
-    data = request.get_json()
-    pair = data.get("pair")
-    if not pair:
-        return jsonify({"error": "Specifica una coppia es. BTC/USDT"}), 400
-    if pair not in bot_status["pairs"]:
-        bot_status["pairs"].append(pair)
-        return jsonify({"message": f"Coppia {pair} aggiunta con successo."})
-    return jsonify({"message": f"La coppia {pair} è già monitorata."})
-
-# =============== DASHBOARD HTML ===============
-HTML_PAGE = """
-<!DOCTYPE html>
-<html lang="it">
-<head>
-    <meta charset="UTF-8">
-    <title>MEXC Quanto Bot Dashboard</title>
-    <style>
-        body { font-family: Arial, sans-serif; background: #121212; color: #e0e0e0; margin: 0; padding: 20px; }
-        h1 { color: #00ffc3; }
-        table { border-collapse: collapse; width: 100%; margin-top: 20px; }
-        th, td { border-bottom: 1px solid #333; padding: 10px; text-align: left; }
-        th { background: #222; color: #00ffc3; }
-        tr:hover { background: #1e1e1e; }
-        .positive { color: #00ff6a; }
-        .negative { color: #ff5252; }
-        input[type="text"] { padding: 8px; border: none; border-radius: 4px; width: 200px; }
-        button { padding: 8px 15px; border: none; border-radius: 4px; background: #00ffc3; color: #000; cursor: pointer; }
-        button:hover { background: #00c89a; }
-    </style>
-    <script>
-        async function loadSpreads() {
-            const res = await fetch('/spreads');
-            const data = await res.json();
-            const tbody = document.getElementById('spread-table');
-            tbody.innerHTML = '';
-            data.forEach(row => {
-                const tr = document.createElement('tr');
-                tr.innerHTML = `
-                    <td>${row.pair}</td>
-                    <td class="${row.spread >= 0 ? 'positive' : 'negative'}">${row.spread.toFixed(3)}%</td>
-                `;
-                tbody.appendChild(tr);
-            });
-        }
-
-        async function addPair() {
-            const pair = document.getElementById('pair-input').value;
-            if (!pair) return alert("Inserisci una coppia es. BTC/USDT");
-            await fetch('/addpair', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ pair })
-            });
-            document.getElementById('pair-input').value = '';
-            loadSpreads();
-        }
-
-        setInterval(loadSpreads, 5000);
-        window.onload = loadSpreads;
-    </script>
-</head>
-<body>
-    <h1>📊 Mexc Quanto Bot Dashboard</h1>
-    <p>Monitoraggio in tempo reale delle coppie MEXC ↔ Quanto.trade</p>
-    <div>
-        <input id="pair-input" type="text" placeholder="Aggiungi coppia es. BTC/USDT" />
-        <button onclick="addPair()">Aggiungi Coppia</button>
-    </div>
-    <table>
-        <thead>
-            <tr>
-                <th>Coppia</th>
-                <th>Spread (%)</th>
-            </tr>
-        </thead>
-        <tbody id="spread-table"></tbody>
-    </table>
-</body>
-</html>
-"""
+    return "✅ Mexc Quanto Bot is running! Vai su /dashboard per controllare."
 
 @app.route('/dashboard')
 def dashboard():
-    return render_template_string(HTML_PAGE)
+    html = """
+    <h2>MEXC Quanto Bot Dashboard</h2>
+    <p>Coppie monitorate:</p>
+    <ul>
+    {% for pair in pairs %}
+        <li>{{ pair }}
+        <form action="/removepair" method="post" style="display:inline;">
+            <input type="hidden" name="pair" value="{{ pair }}">
+            <button type="submit">❌ Rimuovi</button>
+        </form>
+        </li>
+    {% endfor %}
+    </ul>
+    <form action="/addpair" method="post">
+        <input name="pair" placeholder="es. BTC/USDT" required>
+        <button type="submit">➕ Aggiungi coppia</button>
+    </form>
+    """
+    return render_template_string(html, pairs=PAIRS)
 
-# Porta per Render
-port = int(os.environ.get("PORT", 10000))
-app.run(host="0.0.0.0", port=port)
+@app.route('/addpair', methods=['POST'])
+def addpair():
+    pair = request.form.get('pair')
+    if not pair:
+        return "Manca la coppia", 400
+    if pair not in PAIRS:
+        PAIRS.append(pair)
+        CONFIG["PAIRS"] = PAIRS
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(CONFIG, f, indent=4)
+        return f"Aggiunta {pair} con successo! <a href='/dashboard'>Torna</a>"
+    else:
+        return f"{pair} è già presente! <a href='/dashboard'>Torna</a>"
+
+@app.route('/removepair', methods=['POST'])
+def removepair():
+    pair = request.form.get('pair')
+    if pair in PAIRS:
+        PAIRS.remove(pair)
+        CONFIG["PAIRS"] = PAIRS
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(CONFIG, f, indent=4)
+        return f"Rimossa {pair} con successo! <a href='/dashboard'>Torna</a>"
+    return "Coppia non trovata! <a href='/dashboard'>Torna</a>"
+
+def start_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
 # ---------------- ENTRYPOINT ----------------
 if __name__ == "__main__":
+    threading.Thread(target=lambda: asyncio.run(poll_loop()), daemon=True).start()
+    start_flask()
 
-    asyncio.run(poll_loop())
