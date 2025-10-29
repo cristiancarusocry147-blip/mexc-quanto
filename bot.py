@@ -36,7 +36,7 @@ def load_config():
         example = {
             "TELEGRAM_TOKEN": "8471152392:AAHHYjhIcaGV1DVherO5sVYKO8OZubgY4r0",
             "CHAT_ID": "721323324",
-            "SPREAD_THRESHOLD": 1.0,
+            "SPREAD_THRESHOLD": 2.0,
             "PAIRS": []
         }
         with open(CONFIG_FILE, "w") as f:
@@ -260,6 +260,7 @@ if __name__ == "__main__":
     import threading
     threading.Thread(target=lambda: asyncio.run(poll_loop()), daemon=True).start()
     app.run(host="0.0.0.0", port=5000)
+
 
 
 
