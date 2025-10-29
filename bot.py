@@ -6,19 +6,13 @@ import time
 import logging
 import traceback
 from datetime import datetime
-from flask import Flask, render_template_string, request, redirect, jsonify
+from flask import Flask, render_template_string, request, redirect
 
 CONFIG_FILE = "config.json"
 POLL_INTERVAL = 3
-REFRESH_MARKETS = 600   # ogni 10 minuti
+MAX_PAIRS = 50
 CONCURRENCY = 10
 LOG_FILE = "bot.log"
-AUTO_LIMIT = 60
-
-prices_cache = {}
-pairs_cache = []
-last_refresh = 0
-notified_new_pairs = set()
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(
@@ -35,14 +29,14 @@ def load_config():
     try:
         with open(CONFIG_FILE, "r") as f:
             data = json.load(f)
-            data.setdefault("SPREAD_THRESHOLD", 2.0)
+            data.setdefault("SPREAD_THRESHOLD", 1.0)
             data.setdefault("PAIRS", [])
             return data
     except FileNotFoundError:
         example = {
-            "TELEGRAM_TOKEN": "8471152392:AAHHYjhIcaGV1DVherO5sVYKO8OZubgY4r0",
-            "CHAT_ID": "721323324",
-            "SPREAD_THRESHOLD": 2.0,
+            "TELEGRAM_TOKEN": "INSERISCI_IL_TUO_TOKEN",
+            "CHAT_ID": "INSERISCI_CHAT_ID",
+            "SPREAD_THRESHOLD": 1.0,
             "PAIRS": []
         }
         with open(CONFIG_FILE, "w") as f:
@@ -53,7 +47,8 @@ def load_config():
 CONFIG = load_config()
 TELEGRAM_TOKEN = CONFIG.get("TELEGRAM_TOKEN")
 CHAT_ID = CONFIG.get("CHAT_ID")
-SPREAD_THRESHOLD = float(CONFIG.get("SPREAD_THRESHOLD", 2.0))
+SPREAD_THRESHOLD = float(CONFIG.get("SPREAD_THRESHOLD", 1.0))
+PAIRS = CONFIG.get("PAIRS", [])
 
 # ---------------- TELEGRAM ----------------
 async def send_telegram_message(text, session=None):
@@ -117,48 +112,40 @@ async def build_pairs(exchange, limit=MAX_PAIRS):
 
 # ---------------- MAIN LOOP ----------------
 async def poll_loop():
-    global prices_cache, pairs_cache, last_refresh, notified_new_pairs
     ccxt_mexc = ccxt.mexc({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     session = aiohttp.ClientSession()
     semaphore = asyncio.Semaphore(CONCURRENCY)
+    prices = {}
+    last_spread = {}
+    start_time = time.time()
 
-    pairs_cache = CONFIG.get("PAIRS", [])
-    if not pairs_cache:
-        pairs_cache = await get_latest_pairs(ccxt_mexc, AUTO_LIMIT)
-    last_refresh = time.time()
+    if PAIRS:
+        pairs = PAIRS
+        logging.info(f"Monitoraggio di {len(pairs)} coppie dal config.json")
+    else:
+        pairs = await build_pairs(ccxt_mexc)
+        logging.info(f"Nessuna coppia specificata, caricate {len(pairs)} coppie da MEXC")
 
-    await send_telegram_message(f"🤖 Bot avviato. Monitoraggio di {len(pairs_cache)} coppie.", session)
+    await send_telegram_message(f"🤖 Bot avviato.\nMonitoraggio di {len(pairs)} coppie su MEXC.", session)
+
+    asyncio.create_task(handle_status_commands(session, prices, start_time))
 
     try:
         while True:
-            # 🔁 Aggiorna lista coppie ogni 10 minuti
-            if time.time() - last_refresh > REFRESH_MARKETS:
-                new_pairs = await get_latest_pairs(ccxt_mexc, AUTO_LIMIT)
-                added = [p for p in new_pairs if p not in pairs_cache]
-                if added:
-                    msg = f"🆕 Nuove coppie listate su MEXC:\n" + "\n".join(added[:10])
-                    logging.info(msg)
-                    await send_telegram_message(msg, session)
-                    notified_new_pairs.update(added)
-                pairs_cache = list(set(pairs_cache + new_pairs))
-                last_refresh = time.time()
-
-            # 🧮 Calcolo spread
             tasks = []
-            for symbol in pairs_cache:
+            for symbol in pairs:
                 async with semaphore:
-                    tasks.append(process_pair(symbol, ccxt_mexc, session))
+                    tasks.append(process_pair(symbol, ccxt_mexc, session, prices, last_spread))
             await asyncio.gather(*tasks)
             await asyncio.sleep(POLL_INTERVAL)
     except Exception as e:
-        logging.error(f"Errore loop: {e}\n{traceback.format_exc()}")
+        logging.error(f"Errore nel loop: {e}\n{traceback.format_exc()}")
         await send_telegram_message(f"❌ Errore: {e}", session)
     finally:
-        await ccxt_mexc.close()
         await session.close()
+        await ccxt_mexc.close()
 
-async def process_pair(symbol, exchange, session):
-    global prices_cache
+async def process_pair(symbol, exchange, session, prices, last_spread):
     try:
         mexc_p = await fetch_mexc_price(exchange, symbol)
         if not mexc_p:
@@ -168,12 +155,44 @@ async def process_pair(symbol, exchange, session):
         if not quanto_p:
             return
         spread = (quanto_p - mexc_p) / mexc_p * 100
-        prices_cache[symbol] = {"mexc": mexc_p, "quanto": quanto_p, "spread": spread}
-        if abs(spread) >= SPREAD_THRESHOLD:
-            msg = f"{'🟢' if spread>0 else '🔴'} {symbol}\nSpread: {spread:.2f}%"
+        prices[symbol] = spread
+
+        prev = last_spread.get(symbol, 0)
+        if abs(spread) >= SPREAD_THRESHOLD and abs(spread) > abs(prev):
+            direction = "Compra su MEXC / Vendi su Quanto" if spread > 0 else "Vendi su MEXC / Compra su Quanto"
+            msg = f"{'🟢' if spread>0 else '🔴'} {symbol}\nSpread: {spread:.2f}%\n{direction}"
+            logging.info(msg)
             await send_telegram_message(msg, session)
+        last_spread[symbol] = spread
     except Exception as e:
         logging.debug(f"Errore {symbol}: {e}")
+
+# ---------------- STATUS HANDLER ----------------
+async def handle_status_commands(session, prices, start_time):
+    offset = 0
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    while True:
+        try:
+            async with session.get(url, params={"offset": offset, "timeout": 10}) as resp:
+                data = await resp.json()
+                for update in data.get("result", []):
+                    offset = update["update_id"] + 1
+                    msg = update.get("message", {}).get("text", "")
+                    chat_id = update.get("message", {}).get("chat", {}).get("id")
+                    if msg == "/status" and str(chat_id) == str(CHAT_ID):
+                        uptime = int(time.time() - start_time)
+                        avg_spread = sum(prices.values()) / len(prices) if prices else 0
+                        text = (
+                            f"📊 *Status Bot*\n"
+                            f"Coppie monitorate: {len(prices)}\n"
+                            f"Spread medio: {avg_spread:.2f}%\n"
+                            f"Uptime: {uptime//3600}h {uptime%3600//60}m\n"
+                            f"Ultimo update: {datetime.utcnow().strftime('%H:%M:%S UTC')}"
+                        )
+                        await send_telegram_message(text, session)
+        except Exception:
+            pass
+        await asyncio.sleep(5)
 
 # ---------------- WEB DASHBOARD ----------------
 app = Flask(__name__)
@@ -263,6 +282,7 @@ if __name__ == "__main__":
     import threading
     threading.Thread(target=lambda: asyncio.run(poll_loop()), daemon=True).start()
     app.run(host="0.0.0.0", port=5000)
+
 
 
 
