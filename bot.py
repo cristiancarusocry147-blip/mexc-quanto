@@ -8,17 +8,14 @@ import traceback
 from datetime import datetime
 from flask import Flask, render_template_string, jsonify
 
-# ---------------- CONFIG ----------------
 CONFIG_FILE = "config.json"
 POLL_INTERVAL = 3
 CONCURRENCY = 10
 LOG_FILE = "bot.log"
 
-# ---------------- GLOBAL STATE ----------------
 prices_cache = {}
 AUTO_LIMIT = 60
 
-# ---------------- LOGGING ----------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -28,7 +25,6 @@ logging.basicConfig(
     ]
 )
 
-# ---------------- CONFIG ----------------
 def load_config():
     try:
         with open(CONFIG_FILE, "r") as f:
@@ -43,7 +39,6 @@ def load_config():
         }
         with open(CONFIG_FILE, "w") as f:
             json.dump(cfg, f, indent=4)
-        logging.info("Creato config.json di default.")
     return cfg
 
 CONFIG = load_config()
@@ -51,22 +46,6 @@ AUTO_MODE = CONFIG.get("AUTO_MODE", True)
 AUTO_LIMIT = CONFIG.get("AUTO_LIMIT", 60)
 SPREAD_THRESHOLD = CONFIG.get("SPREAD_THRESHOLD", 1.0)
 
-# ---------------- TELEGRAM (opzionale) ----------------
-async def send_telegram_message(text, session=None):
-    token = CONFIG.get("TELEGRAM_TOKEN")
-    chat_id = CONFIG.get("CHAT_ID")
-    if not token or not chat_id:
-        return
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text}
-    try:
-        async with session.post(url, data=payload) as resp:
-            if resp.status != 200:
-                logging.warning(f"Telegram HTTP {resp.status}")
-    except Exception as e:
-        logging.error(f"Errore Telegram: {e}")
-
-# ---------------- FETCH HELPERS ----------------
 async def fetch_mexc_price(exchange, symbol):
     try:
         ticker = await exchange.fetch_ticker(symbol)
@@ -111,14 +90,17 @@ async def get_latest_pairs(exchange, limit=AUTO_LIMIT):
     swap_pairs = [
         (s, m)
         for s, m in markets.items()
-        if m.get("type") == "swap" and ("USDT" in s or "USD" in s)
+        if m.get("type") in ("swap", "future") and ("USDT" in s or "USD" in s)
     ]
-    swap_pairs.sort(key=lambda x: x[1].get("info", {}).get("listing_date", ""), reverse=True)
+    if not swap_pairs:
+        logging.warning("⚠️ Nessuna coppia swap trovata su MEXC!")
+        return []
+    # Ordina prima per listing_date, poi per nome (fallback)
+    swap_pairs.sort(key=lambda x: x[1].get("info", {}).get("listing_date", x[0]), reverse=True)
     pairs = [s for s, _ in swap_pairs[:limit]]
-    logging.info(f"✅ Trovate {len(pairs)} nuove coppie da monitorare.")
+    logging.info(f"✅ Trovate {len(pairs)} coppie (esempio: {pairs[:5]})")
     return pairs
 
-# ---------------- MAIN LOOP ----------------
 async def poll_loop():
     global prices_cache
     ccxt_mexc = ccxt.mexc({"enableRateLimit": True, "options": {"defaultType": "swap"}})
@@ -126,10 +108,12 @@ async def poll_loop():
     semaphore = asyncio.Semaphore(CONCURRENCY)
 
     pairs = await get_latest_pairs(ccxt_mexc, AUTO_LIMIT)
+    if not pairs:
+        logging.warning("⚠️ Nessuna coppia trovata! Controlla la connessione o MEXC API.")
+        await asyncio.sleep(10)
+        return
 
-    logging.info(f"Monitoraggio automatico di {len(pairs)} coppie MEXC (auto mode attiva).")
-    await send_telegram_message(f"🤖 Bot avviato. Monitoraggio automatico di {len(pairs)} nuove coppie.", session)
-
+    logging.info(f"Monitoraggio automatico di {len(pairs)} coppie MEXC.")
     try:
         while True:
             tasks = []
@@ -140,7 +124,6 @@ async def poll_loop():
             await asyncio.sleep(POLL_INTERVAL)
     except Exception as e:
         logging.error(f"Errore loop: {e}\n{traceback.format_exc()}")
-        await send_telegram_message(f"❌ Errore: {e}", session)
     finally:
         await ccxt_mexc.close()
         await session.close()
@@ -161,11 +144,11 @@ async def process_pair(symbol, exchange, session):
             "quanto": quanto_p,
             "spread": spread,
         }
-        logging.info(f"{symbol} spread {spread:.2f}%")
     except Exception as e:
         logging.debug(f"Errore {symbol}: {e}")
 
 # ---------------- WEB DASHBOARD ----------------
+from flask import Flask, jsonify, render_template_string
 app = Flask(__name__)
 
 @app.route("/")
@@ -232,11 +215,11 @@ def dashboard():
 def api_prices():
     return jsonify(prices_cache)
 
-# ---------------- ENTRYPOINT ----------------
 if __name__ == "__main__":
     import threading
     threading.Thread(target=lambda: asyncio.run(poll_loop()), daemon=True).start()
     app.run(host="0.0.0.0", port=5000)
+
 
 
 
