@@ -88,18 +88,18 @@ async def fetch_quanto_price(session, market_code):
                     bid = float(bids[0][0])
                     ask = float(asks[0][0])
                     return (bid + ask) / 2
+        return None
     except Exception:
-        pass
-    return None
+        return None
 
 async def try_quanto_mappings(session, base_symbol):
     candidates = [
-        f"{base_symbol}-USDT-SWAP-LIN",
         f"{base_symbol}-USD-SWAP-LIN",
-        f"{base_symbol}-USDT-SWAP",
+        f"{base_symbol}-USDT-SWAP-LIN",
         f"{base_symbol}-USD-SWAP",
-        f"{base_symbol}-USDT",
+        f"{base_symbol}-USDT-SWAP",
         f"{base_symbol}-USD",
+        f"{base_symbol}-USDT",
     ]
     for c in candidates:
         p = await fetch_quanto_price(session, c)
@@ -107,21 +107,13 @@ async def try_quanto_mappings(session, base_symbol):
             return c, p
     return None, None
 
-async def get_latest_pairs(exchange, limit=AUTO_LIMIT):
-    logging.info("🔍 Recupero lista mercati da MEXC...")
+async def build_pairs(exchange, limit=MAX_PAIRS):
     markets = await exchange.load_markets()
     swap_pairs = [
-        (s, m)
-        for s, m in markets.items()
-        if m.get("type") in ("swap", "future") and ("USDT" in s or "USD" in s)
+        s for s, m in markets.items()
+        if m.get("type") == "swap" and ("USDT" in s or "USD" in s)
     ]
-    if not swap_pairs:
-        logging.warning("⚠️ Nessuna coppia trovata su MEXC!")
-        return []
-    swap_pairs.sort(key=lambda x: x[1].get("info", {}).get("listing_date", x[0]), reverse=True)
-    pairs = [s for s, _ in swap_pairs[:limit]]
-    logging.info(f"✅ Trovate {len(pairs)} coppie (es: {pairs[:5]})")
-    return pairs
+    return swap_pairs[:limit]
 
 # ---------------- MAIN LOOP ----------------
 async def poll_loop():
@@ -271,6 +263,7 @@ if __name__ == "__main__":
     import threading
     threading.Thread(target=lambda: asyncio.run(poll_loop()), daemon=True).start()
     app.run(host="0.0.0.0", port=5000)
+
 
 
 
