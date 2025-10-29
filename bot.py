@@ -6,13 +6,15 @@ import time
 import logging
 import traceback
 from datetime import datetime
-from flask import Flask, render_template_string, request, redirect
+from flask import Flask, render_template_string, request, redirect, jsonify
 
+# ---------------- GLOBAL STATE ----------------
 CONFIG_FILE = "config.json"
 POLL_INTERVAL = 3
 MAX_PAIRS = 50
 CONCURRENCY = 10
 LOG_FILE = "bot.log"
+prices_cache = {}  # 👈 condiviso tra loop e Flask
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(
@@ -127,7 +129,6 @@ async def poll_loop():
         logging.info(f"Nessuna coppia specificata, caricate {len(pairs)} coppie da MEXC")
 
     await send_telegram_message(f"🤖 Bot avviato.\nMonitoraggio di {len(pairs)} coppie su MEXC.", session)
-
     asyncio.create_task(handle_status_commands(session, prices, start_time))
 
     try:
@@ -146,6 +147,7 @@ async def poll_loop():
         await ccxt_mexc.close()
 
 async def process_pair(symbol, exchange, session, prices, last_spread):
+    global prices_cache
     try:
         mexc_p = await fetch_mexc_price(exchange, symbol)
         if not mexc_p:
@@ -156,6 +158,13 @@ async def process_pair(symbol, exchange, session, prices, last_spread):
             return
         spread = (quanto_p - mexc_p) / mexc_p * 100
         prices[symbol] = spread
+
+        # 🔄 Aggiorna cache per dashboard
+        prices_cache[symbol] = {
+            "mexc": mexc_p,
+            "quanto": quanto_p,
+            "spread": spread
+        }
 
         prev = last_spread.get(symbol, 0)
         if abs(spread) >= SPREAD_THRESHOLD and abs(spread) > abs(prev):
@@ -195,17 +204,11 @@ async def handle_status_commands(session, prices, start_time):
         await asyncio.sleep(5)
 
 # ---------------- WEB DASHBOARD ----------------
-from flask import Flask, render_template_string, request, redirect, jsonify
-
 app = Flask(__name__)
-
-prices_cache = {}  # aggiornato dal loop principale
-
 
 @app.route("/")
 def home():
     return redirect("/dashboard")
-
 
 @app.route("/dashboard")
 def dashboard():
@@ -216,57 +219,25 @@ def dashboard():
         <meta charset="UTF-8">
         <title>Trading Dashboard</title>
         <style>
-            body {
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                background-color: #0b0e11;
-                color: #e0e0e0;
-                margin: 0;
-                padding: 20px;
-            }
-            h2 { color: #00ff99; }
-            table {
-                width: 100%;
-                border-collapse: collapse;
-                margin-top: 15px;
-            }
-            th, td {
-                border: 1px solid #222;
-                padding: 8px;
-                text-align: center;
-            }
-            th {
-                background-color: #12181f;
-            }
-            tr:nth-child(even) {
-                background-color: #161b22;
-            }
-            .positive { color: #00ff99; }
-            .negative { color: #ff5555; }
-            button {
-                padding: 5px 10px;
-                background-color: #222;
-                border: 1px solid #333;
-                border-radius: 5px;
-                color: #eee;
-                cursor: pointer;
-            }
-            button:hover {
-                background-color: #00ff99;
-                color: #000;
-            }
-            input {
-                padding: 5px;
-                background: #12181f;
-                color: #eee;
-                border: 1px solid #333;
-                border-radius: 5px;
-            }
+            body { font-family: 'Segoe UI'; background:#0b0e11; color:#e0e0e0; margin:0; padding:20px; }
+            h2 { color:#00ff99; }
+            #status { margin-bottom:10px; color:#888; }
+            table { width:100%; border-collapse:collapse; margin-top:10px; }
+            th, td { border:1px solid #222; padding:6px; text-align:center; }
+            th { background:#12181f; }
+            tr:nth-child(even){ background:#161b22; }
+            .positive{ color:#00ff99; }
+            .negative{ color:#ff5555; }
+            button { padding:5px 10px; background:#222; color:#eee; border:1px solid #333; border-radius:5px; cursor:pointer; }
+            button:hover{ background:#00ff99; color:#000; }
+            input{ padding:5px; background:#12181f; color:#eee; border:1px solid #333; border-radius:5px; }
         </style>
     </head>
     <body>
         <h2>📊 MEXC Quanto Trading Dashboard</h2>
+        <div id="status">Caricamento dati...</div>
 
-        <form id="addForm" style="margin-bottom:10px;">
+        <form id="addForm">
             <input name="pair" id="pairInput" placeholder="es. BTC/USDT" required>
             <button type="submit">➕ Aggiungi coppia</button>
         </form>
@@ -289,7 +260,10 @@ def dashboard():
                 const res = await fetch("/api/prices");
                 const data = await res.json();
                 const table = document.getElementById("pairsTable");
+                const status = document.getElementById("status");
                 table.innerHTML = "";
+                const now = new Date().toLocaleTimeString();
+                status.innerText = `Ultimo aggiornamento: ${now} | Coppie: ${Object.keys(data).length}`;
                 for (const [pair, info] of Object.entries(data)) {
                     const tr = document.createElement("tr");
                     const spreadClass = info.spread > 0 ? 'positive' : 'negative';
@@ -329,11 +303,10 @@ def dashboard():
     """
     return render_template_string(html)
 
-
 @app.route("/api/prices")
 def api_prices():
+    logging.info(f"/api/prices -> {len(prices_cache)} coppie")
     return jsonify(prices_cache)
-
 
 @app.route("/addpair", methods=["POST"])
 def add_pair():
@@ -341,14 +314,12 @@ def add_pair():
     if pair:
         with open(CONFIG_FILE, "r") as f:
             cfg = json.load(f)
-        if "PAIRS" not in cfg:
-            cfg["PAIRS"] = []
+        cfg.setdefault("PAIRS", [])
         if pair not in cfg["PAIRS"]:
             cfg["PAIRS"].append(pair)
         with open(CONFIG_FILE, "w") as f:
             json.dump(cfg, f, indent=4)
     return redirect("/dashboard")
-
 
 @app.route("/removepair", methods=["POST"])
 def remove_pair():
