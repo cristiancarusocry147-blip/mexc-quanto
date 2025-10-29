@@ -6,16 +6,21 @@ import time
 import logging
 import traceback
 from datetime import datetime
-from flask import Flask, render_template_string, jsonify
+from flask import Flask, render_template_string, request, redirect, jsonify
 
 CONFIG_FILE = "config.json"
 POLL_INTERVAL = 3
+REFRESH_MARKETS = 600   # ogni 10 minuti
 CONCURRENCY = 10
 LOG_FILE = "bot.log"
-
-prices_cache = {}
 AUTO_LIMIT = 60
 
+prices_cache = {}
+pairs_cache = []
+last_refresh = 0
+notified_new_pairs = set()
+
+# ---------------- LOGGING ----------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -25,27 +30,45 @@ logging.basicConfig(
     ]
 )
 
+# ---------------- CONFIG ----------------
 def load_config():
     try:
         with open(CONFIG_FILE, "r") as f:
-            cfg = json.load(f)
+            data = json.load(f)
+            data.setdefault("SPREAD_THRESHOLD", 2.0)
+            data.setdefault("PAIRS", [])
+            return data
     except FileNotFoundError:
-        cfg = {
+        example = {
             "TELEGRAM_TOKEN": "8471152392:AAHHYjhIcaGV1DVherO5sVYKO8OZubgY4r0",
             "CHAT_ID": "721323324",
-            "SPREAD_THRESHOLD": 1.0,
-            "AUTO_MODE": True,
-            "AUTO_LIMIT": 60
+            "SPREAD_THRESHOLD": 2.0,
+            "PAIRS": []
         }
         with open(CONFIG_FILE, "w") as f:
-            json.dump(cfg, f, indent=4)
-    return cfg
+            json.dump(example, f, indent=4)
+        print("Creato config.json — inserisci il tuo TOKEN Telegram e CHAT_ID.")
+        raise SystemExit(1)
 
 CONFIG = load_config()
-AUTO_MODE = CONFIG.get("AUTO_MODE", True)
-AUTO_LIMIT = CONFIG.get("AUTO_LIMIT", 60)
-SPREAD_THRESHOLD = CONFIG.get("SPREAD_THRESHOLD", 1.0)
+TELEGRAM_TOKEN = CONFIG.get("TELEGRAM_TOKEN")
+CHAT_ID = CONFIG.get("CHAT_ID")
+SPREAD_THRESHOLD = float(CONFIG.get("SPREAD_THRESHOLD", 2.0))
 
+# ---------------- TELEGRAM ----------------
+async def send_telegram_message(text, session=None):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": text}
+    try:
+        async with session.post(url, data=payload) as resp:
+            if resp.status != 200:
+                logging.warning(f"Telegram HTTP {resp.status}")
+    except Exception as e:
+        logging.error(f"Errore Telegram: {e}")
+
+# ---------------- FETCH HELPERS ----------------
 async def fetch_mexc_price(exchange, symbol):
     try:
         ticker = await exchange.fetch_ticker(symbol)
@@ -93,37 +116,51 @@ async def get_latest_pairs(exchange, limit=AUTO_LIMIT):
         if m.get("type") in ("swap", "future") and ("USDT" in s or "USD" in s)
     ]
     if not swap_pairs:
-        logging.warning("⚠️ Nessuna coppia swap trovata su MEXC!")
+        logging.warning("⚠️ Nessuna coppia trovata su MEXC!")
         return []
-    # Ordina prima per listing_date, poi per nome (fallback)
     swap_pairs.sort(key=lambda x: x[1].get("info", {}).get("listing_date", x[0]), reverse=True)
     pairs = [s for s, _ in swap_pairs[:limit]]
-    logging.info(f"✅ Trovate {len(pairs)} coppie (esempio: {pairs[:5]})")
+    logging.info(f"✅ Trovate {len(pairs)} coppie (es: {pairs[:5]})")
     return pairs
 
+# ---------------- MAIN LOOP ----------------
 async def poll_loop():
-    global prices_cache
+    global prices_cache, pairs_cache, last_refresh, notified_new_pairs
     ccxt_mexc = ccxt.mexc({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     session = aiohttp.ClientSession()
     semaphore = asyncio.Semaphore(CONCURRENCY)
 
-    pairs = await get_latest_pairs(ccxt_mexc, AUTO_LIMIT)
-    if not pairs:
-        logging.warning("⚠️ Nessuna coppia trovata! Controlla la connessione o MEXC API.")
-        await asyncio.sleep(10)
-        return
+    pairs_cache = CONFIG.get("PAIRS", [])
+    if not pairs_cache:
+        pairs_cache = await get_latest_pairs(ccxt_mexc, AUTO_LIMIT)
+    last_refresh = time.time()
 
-    logging.info(f"Monitoraggio automatico di {len(pairs)} coppie MEXC.")
+    await send_telegram_message(f"🤖 Bot avviato. Monitoraggio di {len(pairs_cache)} coppie.", session)
+
     try:
         while True:
+            # 🔁 Aggiorna lista coppie ogni 10 minuti
+            if time.time() - last_refresh > REFRESH_MARKETS:
+                new_pairs = await get_latest_pairs(ccxt_mexc, AUTO_LIMIT)
+                added = [p for p in new_pairs if p not in pairs_cache]
+                if added:
+                    msg = f"🆕 Nuove coppie listate su MEXC:\n" + "\n".join(added[:10])
+                    logging.info(msg)
+                    await send_telegram_message(msg, session)
+                    notified_new_pairs.update(added)
+                pairs_cache = list(set(pairs_cache + new_pairs))
+                last_refresh = time.time()
+
+            # 🧮 Calcolo spread
             tasks = []
-            for symbol in pairs:
+            for symbol in pairs_cache:
                 async with semaphore:
                     tasks.append(process_pair(symbol, ccxt_mexc, session))
             await asyncio.gather(*tasks)
             await asyncio.sleep(POLL_INTERVAL)
     except Exception as e:
         logging.error(f"Errore loop: {e}\n{traceback.format_exc()}")
+        await send_telegram_message(f"❌ Errore: {e}", session)
     finally:
         await ccxt_mexc.close()
         await session.close()
@@ -139,86 +176,102 @@ async def process_pair(symbol, exchange, session):
         if not quanto_p:
             return
         spread = (quanto_p - mexc_p) / mexc_p * 100
-        prices_cache[symbol] = {
-            "mexc": mexc_p,
-            "quanto": quanto_p,
-            "spread": spread,
-        }
+        prices_cache[symbol] = {"mexc": mexc_p, "quanto": quanto_p, "spread": spread}
+        if abs(spread) >= SPREAD_THRESHOLD:
+            msg = f"{'🟢' if spread>0 else '🔴'} {symbol}\nSpread: {spread:.2f}%"
+            await send_telegram_message(msg, session)
     except Exception as e:
         logging.debug(f"Errore {symbol}: {e}")
 
 # ---------------- WEB DASHBOARD ----------------
-from flask import Flask, jsonify, render_template_string
 app = Flask(__name__)
 
 @app.route("/")
 def dashboard():
     html = """
-    <!DOCTYPE html>
-    <html lang="it">
-    <head>
-        <meta charset="UTF-8">
-        <title>MEXC Auto Dashboard</title>
-        <style>
-            body{font-family:'Segoe UI';background:#0b0e11;color:#e0e0e0;margin:0;padding:20px;}
-            h2{color:#00ff99;}
-            #status{margin-bottom:10px;color:#888;}
-            table{width:100%;border-collapse:collapse;margin-top:10px;}
-            th,td{border:1px solid #222;padding:6px;text-align:center;}
-            th{background:#12181f;}
-            tr:nth-child(even){background:#161b22;}
-            .positive{color:#00ff99;}
-            .negative{color:#ff5555;}
-        </style>
-    </head>
-    <body>
-        <h2>📈 MEXC Quanto Auto Dashboard</h2>
-        <p>🧠 Modalità: <b style="color:#00ff99;">Automatica</b> — Ultime {{limit}} coppie listate su MEXC</p>
-        <div id="status">Caricamento dati...</div>
-        <table>
-            <thead>
-                <tr>
-                    <th>Coppia</th><th>MEXC</th><th>Quanto</th><th>Spread %</th>
-                </tr>
-            </thead>
-            <tbody id="pairsTable"></tbody>
-        </table>
-        <script>
-            async function loadPairs(){
-                const res = await fetch("/api/prices");
-                const data = await res.json();
-                const table=document.getElementById("pairsTable");
-                const status=document.getElementById("status");
-                table.innerHTML="";
-                const now=new Date().toLocaleTimeString();
-                status.innerText=`Ultimo aggiornamento: ${now} | Coppie: ${Object.keys(data).length}`;
-                for(const [pair,info] of Object.entries(data)){
-                    const spreadClass=info.spread>0?'positive':'negative';
-                    table.innerHTML+=`
-                        <tr>
-                            <td>${pair}</td>
-                            <td>${info.mexc?.toFixed(4)??'-'}</td>
-                            <td>${info.quanto?.toFixed(4)??'-'}</td>
-                            <td class="${spreadClass}">${info.spread?.toFixed(2)??'-'}%</td>
-                        </tr>`;
-                }
-            }
-            setInterval(loadPairs,3000);
-            loadPairs();
-        </script>
-    </body>
-    </html>
+    <html><head><title>Dashboard</title>
+    <style>
+    body{font-family:Segoe UI;background:#0b0e11;color:#e0e0e0;padding:20px;}
+    h2{color:#00ff99;}
+    table{width:100%;border-collapse:collapse;margin-top:10px;}
+    th,td{border:1px solid #222;padding:6px;text-align:center;}
+    th{background:#12181f;}
+    tr:nth-child(even){background:#161b22;}
+    .positive{color:#00ff99;} .negative{color:#ff5555;}
+    input,button{padding:5px;border-radius:5px;}
+    </style>
+    </head><body>
+    <h2>📊 MEXC Quanto Dashboard</h2>
+    <p>Monitoraggio automatico + coppie manuali</p>
+    <form method="POST" action="/addpair">
+      <input name="pair" placeholder="es. BTC/USDT" required>
+      <button>➕ Aggiungi coppia</button>
+    </form>
+    <br>
+    <table><thead><tr><th>Coppia</th><th>MEXC</th><th>Quanto</th><th>Spread %</th><th>Rimuovi</th></tr></thead>
+    <tbody id="pairsTable"></tbody></table>
+    <script>
+    async function loadPairs(){
+      const res = await fetch("/api/prices");
+      const data = await res.json();
+      const table=document.getElementById("pairsTable");
+      table.innerHTML="";
+      for(const [pair,info] of Object.entries(data)){
+        const cls=info.spread>0?'positive':'negative';
+        table.innerHTML+=`
+        <tr>
+          <td>${pair}</td>
+          <td>${info.mexc?.toFixed(4)??'-'}</td>
+          <td>${info.quanto?.toFixed(4)??'-'}</td>
+          <td class="${cls}">${info.spread?.toFixed(2)??'-'}%</td>
+          <td><form method='POST' action='/removepair'>
+              <input type='hidden' name='pair' value='${pair}'/>
+              <button>❌</button></form></td>
+        </tr>`;
+      }
+    }
+    setInterval(loadPairs,3000);loadPairs();
+    </script>
+    </body></html>
     """
-    return render_template_string(html, limit=AUTO_LIMIT)
+    return render_template_string(html)
+
+@app.route("/addpair", methods=["POST"])
+def add_pair():
+    pair = request.form.get("pair")
+    if pair:
+        with open(CONFIG_FILE, "r") as f:
+            cfg = json.load(f)
+        if pair not in cfg["PAIRS"]:
+            cfg["PAIRS"].append(pair)
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(cfg, f, indent=4)
+        pairs_cache.append(pair)
+    return redirect("/")
+
+@app.route("/removepair", methods=["POST"])
+def remove_pair():
+    pair = request.form.get("pair")
+    with open(CONFIG_FILE, "r") as f:
+        cfg = json.load(f)
+    if pair in cfg["PAIRS"]:
+        cfg["PAIRS"].remove(pair)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=4)
+    if pair in pairs_cache:
+        pairs_cache.remove(pair)
+    return redirect("/")
 
 @app.route("/api/prices")
 def api_prices():
     return jsonify(prices_cache)
 
+# ---------------- ENTRYPOINT ----------------
 if __name__ == "__main__":
     import threading
     threading.Thread(target=lambda: asyncio.run(poll_loop()), daemon=True).start()
     app.run(host="0.0.0.0", port=5000)
+
 
 
 
