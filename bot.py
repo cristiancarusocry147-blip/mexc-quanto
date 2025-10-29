@@ -195,40 +195,145 @@ async def handle_status_commands(session, prices, start_time):
         await asyncio.sleep(5)
 
 # ---------------- WEB DASHBOARD ----------------
+from flask import Flask, render_template_string, request, redirect, jsonify
+
 app = Flask(__name__)
+
+prices_cache = {}  # aggiornato dal loop principale
+
 
 @app.route("/")
 def home():
     return redirect("/dashboard")
 
+
 @app.route("/dashboard")
 def dashboard():
-    try:
-        with open(CONFIG_FILE, "r") as f:
-            cfg = json.load(f)
-            current_pairs = cfg.get("PAIRS", [])
-    except Exception:
-        current_pairs = PAIRS
-
     html = """
-    <h2>MEXC Quanto Bot Dashboard</h2>
-    <p>Coppie monitorate:</p>
-    <ul>
-    {% for pair in pairs %}
-        <li>{{ pair }}
-        <form action="/removepair" method="post" style="display:inline;">
-            <input type="hidden" name="pair" value="{{ pair }}">
-            <button type="submit">❌ Rimuovi</button>
+    <!DOCTYPE html>
+    <html lang="it">
+    <head>
+        <meta charset="UTF-8">
+        <title>Trading Dashboard</title>
+        <style>
+            body {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                background-color: #0b0e11;
+                color: #e0e0e0;
+                margin: 0;
+                padding: 20px;
+            }
+            h2 { color: #00ff99; }
+            table {
+                width: 100%;
+                border-collapse: collapse;
+                margin-top: 15px;
+            }
+            th, td {
+                border: 1px solid #222;
+                padding: 8px;
+                text-align: center;
+            }
+            th {
+                background-color: #12181f;
+            }
+            tr:nth-child(even) {
+                background-color: #161b22;
+            }
+            .positive { color: #00ff99; }
+            .negative { color: #ff5555; }
+            button {
+                padding: 5px 10px;
+                background-color: #222;
+                border: 1px solid #333;
+                border-radius: 5px;
+                color: #eee;
+                cursor: pointer;
+            }
+            button:hover {
+                background-color: #00ff99;
+                color: #000;
+            }
+            input {
+                padding: 5px;
+                background: #12181f;
+                color: #eee;
+                border: 1px solid #333;
+                border-radius: 5px;
+            }
+        </style>
+    </head>
+    <body>
+        <h2>📊 MEXC Quanto Trading Dashboard</h2>
+
+        <form id="addForm" style="margin-bottom:10px;">
+            <input name="pair" id="pairInput" placeholder="es. BTC/USDT" required>
+            <button type="submit">➕ Aggiungi coppia</button>
         </form>
-        </li>
-    {% endfor %}
-    </ul>
-    <form action="/addpair" method="post">
-        <input name="pair" placeholder="es. BTC/USDT" required>
-        <button type="submit">➕ Aggiungi coppia</button>
-    </form>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>Coppia</th>
+                    <th>Prezzo MEXC</th>
+                    <th>Prezzo Quanto</th>
+                    <th>Spread %</th>
+                    <th>Azioni</th>
+                </tr>
+            </thead>
+            <tbody id="pairsTable"></tbody>
+        </table>
+
+        <script>
+            async function loadPairs() {
+                const res = await fetch("/api/prices");
+                const data = await res.json();
+                const table = document.getElementById("pairsTable");
+                table.innerHTML = "";
+                for (const [pair, info] of Object.entries(data)) {
+                    const tr = document.createElement("tr");
+                    const spreadClass = info.spread > 0 ? 'positive' : 'negative';
+                    tr.innerHTML = `
+                        <td>${pair}</td>
+                        <td>${info.mexc?.toFixed(4) ?? '-'}</td>
+                        <td>${info.quanto?.toFixed(4) ?? '-'}</td>
+                        <td class="${spreadClass}">${info.spread?.toFixed(2) ?? '-'}%</td>
+                        <td>
+                            <form action="/removepair" method="post">
+                                <input type="hidden" name="pair" value="${pair}">
+                                <button type="submit">❌ Rimuovi</button>
+                            </form>
+                        </td>
+                    `;
+                    table.appendChild(tr);
+                }
+            }
+
+            document.getElementById("addForm").addEventListener("submit", async (e) => {
+                e.preventDefault();
+                const pair = document.getElementById("pairInput").value;
+                await fetch("/addpair", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                    body: "pair=" + encodeURIComponent(pair)
+                });
+                document.getElementById("pairInput").value = "";
+                loadPairs();
+            });
+
+            setInterval(loadPairs, 3000);
+            loadPairs();
+        </script>
+    </body>
+    </html>
     """
-    return render_template_string(html, pairs=current_pairs)
+    return render_template_string(html)
+
+
+@app.route("/api/prices")
+def api_prices():
+    return jsonify(prices_cache)
+
 
 @app.route("/addpair", methods=["POST"])
 def add_pair():
@@ -243,6 +348,7 @@ def add_pair():
         with open(CONFIG_FILE, "w") as f:
             json.dump(cfg, f, indent=4)
     return redirect("/dashboard")
+
 
 @app.route("/removepair", methods=["POST"])
 def remove_pair():
@@ -260,6 +366,7 @@ if __name__ == "__main__":
     import threading
     threading.Thread(target=lambda: asyncio.run(poll_loop()), daemon=True).start()
     app.run(host="0.0.0.0", port=5000)
+
 
 
 
