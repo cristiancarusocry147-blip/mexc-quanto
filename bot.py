@@ -6,13 +6,19 @@ import time
 import logging
 import traceback
 from datetime import datetime
-from flask import Flask, render_template_string, request, redirect
+from flask import Flask, render_template_string, request, redirect, jsonify
 
 CONFIG_FILE = "config.json"
 POLL_INTERVAL = 3
-MAX_PAIRS = 50
+REFRESH_MARKETS = 600   # ogni 10 minuti
 CONCURRENCY = 10
 LOG_FILE = "bot.log"
+AUTO_LIMIT = 60
+
+prices_cache = {}
+pairs_cache = []
+last_refresh = 0
+notified_new_pairs = set()
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(
@@ -29,14 +35,14 @@ def load_config():
     try:
         with open(CONFIG_FILE, "r") as f:
             data = json.load(f)
-            data.setdefault("SPREAD_THRESHOLD", 1.0)
+            data.setdefault("SPREAD_THRESHOLD", 2.0)
             data.setdefault("PAIRS", [])
             return data
     except FileNotFoundError:
         example = {
-            "TELEGRAM_TOKEN": "INSERISCI_IL_TUO_TOKEN",
+            "TELEGRAM_TOKEN": "INSERISCI_TOKEN",
             "CHAT_ID": "INSERISCI_CHAT_ID",
-            "SPREAD_THRESHOLD": 1.0,
+            "SPREAD_THRESHOLD": 2.0,
             "PAIRS": []
         }
         with open(CONFIG_FILE, "w") as f:
@@ -47,8 +53,7 @@ def load_config():
 CONFIG = load_config()
 TELEGRAM_TOKEN = CONFIG.get("TELEGRAM_TOKEN")
 CHAT_ID = CONFIG.get("CHAT_ID")
-SPREAD_THRESHOLD = float(CONFIG.get("SPREAD_THRESHOLD", 1.0))
-PAIRS = CONFIG.get("PAIRS", [])
+SPREAD_THRESHOLD = float(CONFIG.get("SPREAD_THRESHOLD", 2.0))
 
 # ---------------- TELEGRAM ----------------
 async def send_telegram_message(text, session=None):
@@ -64,37 +69,37 @@ async def send_telegram_message(text, session=None):
         logging.error(f"Errore Telegram: {e}")
 
 # ---------------- FETCH HELPERS ----------------
-async def fetch_mexc_price(exchange, symbol):
-    try:
-        ticker = await exchange.fetch_ticker(symbol)
-        return float(ticker.get("last")) if ticker.get("last") else None
-    except Exception:
-        return None
+async def get_latest_pairs(exchange, limit=AUTO_LIMIT):
+    logging.info("🔍 Recupero lista mercati da MEXC...")
+    markets = await exchange.load_markets()
+    
+    # includi tutti i mercati derivati che contengono USDT
+    swap_pairs = [
+        (s, m)
+        for s, m in markets.items()
+        if ("USDT" in s or "USD" in s)
+        and ("SWAP" in s.upper() or m.get("type") in ("swap", "future", "contract"))
+    ]
 
-async def fetch_quanto_price(session, market_code):
-    try:
-        url = f"https://api.quanto.trade/v3/depth?marketCode={market_code}&level=1"
-        async with session.get(url, timeout=8) as resp:
-            data = await resp.json()
-            if data.get("success") and "data" in data:
-                bids = data["data"].get("bids", [])
-                asks = data["data"].get("asks", [])
-                if bids and asks:
-                    bid = float(bids[0][0])
-                    ask = float(asks[0][0])
-                    return (bid + ask) / 2
-        return None
-    except Exception:
-        return None
+    if not swap_pairs:
+        logging.warning(f"⚠️ Nessuna coppia trovata ({len(markets)} mercati totali). Provo fallback.")
+        # fallback: prendi direttamente gli ultimi 60 simboli USDT
+        swap_pairs = [(s, m) for s, m in markets.items() if "USDT" in s][:limit]
+
+    # ordina per nome (le nuove di solito sono in fondo)
+    swap_pairs.sort(key=lambda x: x[0], reverse=True)
+    pairs = [s for s, _ in swap_pairs[:limit]]
+    logging.info(f"✅ Trovate {len(pairs)} coppie (es: {pairs[:5]})")
+    return pairs
 
 async def try_quanto_mappings(session, base_symbol):
     candidates = [
-        f"{base_symbol}-USD-SWAP-LIN",
         f"{base_symbol}-USDT-SWAP-LIN",
-        f"{base_symbol}-USD-SWAP",
+        f"{base_symbol}-USD-SWAP-LIN",
         f"{base_symbol}-USDT-SWAP",
-        f"{base_symbol}-USD",
+        f"{base_symbol}-USD-SWAP",
         f"{base_symbol}-USDT",
+        f"{base_symbol}-USD",
     ]
     for c in candidates:
         p = await fetch_quanto_price(session, c)
@@ -102,50 +107,66 @@ async def try_quanto_mappings(session, base_symbol):
             return c, p
     return None, None
 
-async def build_pairs(exchange, limit=MAX_PAIRS):
+async def get_latest_pairs(exchange, limit=AUTO_LIMIT):
+    logging.info("🔍 Recupero lista mercati da MEXC...")
     markets = await exchange.load_markets()
     swap_pairs = [
-        s for s, m in markets.items()
-        if m.get("type") == "swap" and ("USDT" in s or "USD" in s)
+        (s, m)
+        for s, m in markets.items()
+        if m.get("type") in ("swap", "future") and ("USDT" in s or "USD" in s)
     ]
-    return swap_pairs[:limit]
+    if not swap_pairs:
+        logging.warning("⚠️ Nessuna coppia trovata su MEXC!")
+        return []
+    swap_pairs.sort(key=lambda x: x[1].get("info", {}).get("listing_date", x[0]), reverse=True)
+    pairs = [s for s, _ in swap_pairs[:limit]]
+    logging.info(f"✅ Trovate {len(pairs)} coppie (es: {pairs[:5]})")
+    return pairs
 
 # ---------------- MAIN LOOP ----------------
 async def poll_loop():
+    global prices_cache, pairs_cache, last_refresh, notified_new_pairs
     ccxt_mexc = ccxt.mexc({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     session = aiohttp.ClientSession()
     semaphore = asyncio.Semaphore(CONCURRENCY)
-    prices = {}
-    last_spread = {}
-    start_time = time.time()
 
-    if PAIRS:
-        pairs = PAIRS
-        logging.info(f"Monitoraggio di {len(pairs)} coppie dal config.json")
-    else:
-        pairs = await build_pairs(ccxt_mexc)
-        logging.info(f"Nessuna coppia specificata, caricate {len(pairs)} coppie da MEXC")
+    pairs_cache = CONFIG.get("PAIRS", [])
+    if not pairs_cache:
+        pairs_cache = await get_latest_pairs(ccxt_mexc, AUTO_LIMIT)
+    last_refresh = time.time()
 
-    await send_telegram_message(f"🤖 Bot avviato.\nMonitoraggio di {len(pairs)} coppie su MEXC.", session)
-
-    asyncio.create_task(handle_status_commands(session, prices, start_time))
+    await send_telegram_message(f"🤖 Bot avviato. Monitoraggio di {len(pairs_cache)} coppie.", session)
 
     try:
         while True:
+            # 🔁 Aggiorna lista coppie ogni 10 minuti
+            if time.time() - last_refresh > REFRESH_MARKETS:
+                new_pairs = await get_latest_pairs(ccxt_mexc, AUTO_LIMIT)
+                added = [p for p in new_pairs if p not in pairs_cache]
+                if added:
+                    msg = f"🆕 Nuove coppie listate su MEXC:\n" + "\n".join(added[:10])
+                    logging.info(msg)
+                    await send_telegram_message(msg, session)
+                    notified_new_pairs.update(added)
+                pairs_cache = list(set(pairs_cache + new_pairs))
+                last_refresh = time.time()
+
+            # 🧮 Calcolo spread
             tasks = []
-            for symbol in pairs:
+            for symbol in pairs_cache:
                 async with semaphore:
-                    tasks.append(process_pair(symbol, ccxt_mexc, session, prices, last_spread))
+                    tasks.append(process_pair(symbol, ccxt_mexc, session))
             await asyncio.gather(*tasks)
             await asyncio.sleep(POLL_INTERVAL)
     except Exception as e:
-        logging.error(f"Errore nel loop: {e}\n{traceback.format_exc()}")
+        logging.error(f"Errore loop: {e}\n{traceback.format_exc()}")
         await send_telegram_message(f"❌ Errore: {e}", session)
     finally:
-        await session.close()
         await ccxt_mexc.close()
+        await session.close()
 
-async def process_pair(symbol, exchange, session, prices, last_spread):
+async def process_pair(symbol, exchange, session):
+    global prices_cache
     try:
         mexc_p = await fetch_mexc_price(exchange, symbol)
         if not mexc_p:
@@ -155,44 +176,12 @@ async def process_pair(symbol, exchange, session, prices, last_spread):
         if not quanto_p:
             return
         spread = (quanto_p - mexc_p) / mexc_p * 100
-        prices[symbol] = spread
-
-        prev = last_spread.get(symbol, 0)
-        if abs(spread) >= SPREAD_THRESHOLD and abs(spread) > abs(prev):
-            direction = "Compra su MEXC / Vendi su Quanto" if spread > 0 else "Vendi su MEXC / Compra su Quanto"
-            msg = f"{'🟢' if spread>0 else '🔴'} {symbol}\nSpread: {spread:.2f}%\n{direction}"
-            logging.info(msg)
+        prices_cache[symbol] = {"mexc": mexc_p, "quanto": quanto_p, "spread": spread}
+        if abs(spread) >= SPREAD_THRESHOLD:
+            msg = f"{'🟢' if spread>0 else '🔴'} {symbol}\nSpread: {spread:.2f}%"
             await send_telegram_message(msg, session)
-        last_spread[symbol] = spread
     except Exception as e:
         logging.debug(f"Errore {symbol}: {e}")
-
-# ---------------- STATUS HANDLER ----------------
-async def handle_status_commands(session, prices, start_time):
-    offset = 0
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-    while True:
-        try:
-            async with session.get(url, params={"offset": offset, "timeout": 10}) as resp:
-                data = await resp.json()
-                for update in data.get("result", []):
-                    offset = update["update_id"] + 1
-                    msg = update.get("message", {}).get("text", "")
-                    chat_id = update.get("message", {}).get("chat", {}).get("id")
-                    if msg == "/status" and str(chat_id) == str(CHAT_ID):
-                        uptime = int(time.time() - start_time)
-                        avg_spread = sum(prices.values()) / len(prices) if prices else 0
-                        text = (
-                            f"📊 *Status Bot*\n"
-                            f"Coppie monitorate: {len(prices)}\n"
-                            f"Spread medio: {avg_spread:.2f}%\n"
-                            f"Uptime: {uptime//3600}h {uptime%3600//60}m\n"
-                            f"Ultimo update: {datetime.utcnow().strftime('%H:%M:%S UTC')}"
-                        )
-                        await send_telegram_message(text, session)
-        except Exception:
-            pass
-        await asyncio.sleep(5)
 
 # ---------------- WEB DASHBOARD ----------------
 app = Flask(__name__)
@@ -282,6 +271,7 @@ if __name__ == "__main__":
     import threading
     threading.Thread(target=lambda: asyncio.run(poll_loop()), daemon=True).start()
     app.run(host="0.0.0.0", port=5000)
+
 
 
 
