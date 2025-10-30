@@ -34,8 +34,8 @@ def load_config():
             return data
     except FileNotFoundError:
         example = {
-            "TELEGRAM_TOKEN": "8471152392:AAHHYjhIcaGV1DVherO5sVYKO8OZubgY4r0",
-            "CHAT_ID": "721323324",
+            "TELEGRAM_TOKEN": "INSERISCI_IL_TUO_TOKEN",
+            "CHAT_ID": "INSERISCI_CHAT_ID",
             "SPREAD_THRESHOLD": 1.0,
             "PAIRS": []
         }
@@ -260,6 +260,8 @@ if __name__ == "__main__":
     import threading
     threading.Thread(target=lambda: asyncio.run(poll_loop()), daemon=True).start()
     app.run(host="0.0.0.0", port=5000)
+
+
 
 
 
